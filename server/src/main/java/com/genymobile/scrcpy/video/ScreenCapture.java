@@ -191,6 +191,12 @@ public class ScreenCapture extends SurfaceCapture {
         return videoSize;
     }
 
+    @Override
+    protected boolean applyNewVideoConstraints(VideoConstraints videoConstraints) {
+        this.videoConstraints = videoConstraints;
+        return true;
+    }
+
     private static IBinder createDisplay() throws Exception {
         // Since Android 12 (preview), secure displays could not be created with shell permissions anymore.
         // On Android 12 preview, SDK_INT is still R (not S), but CODENAME is "S".

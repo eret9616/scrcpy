@@ -32,6 +32,8 @@ public class SurfaceEncoder implements AsyncProcessor {
     private static final int REPEAT_FRAME_DELAY_US = 100_000; // repeat after 100ms
     private static final String KEY_MAX_FPS_TO_ENCODER = "max-fps-to-encoder";
 
+    // Keep the values in descending order
+    private static final int[] MAX_SIZE_FALLBACK = {2560, 1920, 1600, 1280, 1024, 800};
     private static final int MAX_CONSECUTIVE_ERRORS = 3;
 
     private final SurfaceCapture capture;
@@ -41,6 +43,7 @@ public class SurfaceEncoder implements AsyncProcessor {
     private final int videoBitRate;
     private final int maxSize;
     private final float maxFps;
+    private final boolean downsizeOnError;
     private final int minSizeAlignment;
 
     private boolean firstFrameSent;
@@ -59,6 +62,7 @@ public class SurfaceEncoder implements AsyncProcessor {
         this.maxFps = options.getMaxFps();
         this.codecOptions = options.getVideoCodecOptions();
         this.encoderName = options.getVideoEncoder();
+        this.downsizeOnError = options.getDownsizeOnError();
         this.minSizeAlignment = options.getMinSizeAlignment();
     }
 
@@ -102,11 +106,19 @@ public class SurfaceEncoder implements AsyncProcessor {
 
             streamer.writeVideoHeader();
 
+            int retainedResetReasons = 0;
+
             do {
                 int resetReasons = captureControl.consumeReset();
                 if ((resetReasons & CaptureControl.RESET_REASON_TERMINATED) != 0) {
                     break;
                 }
+                if (retainedResetReasons != 0) {
+                    // The reasons for the previous failed encoding must be preserved when retrying
+                    resetReasons |= retainedResetReasons;
+                    retainedResetReasons = 0;
+                }
+
                 capture.prepare();
                 Size size = capture.getSize();
 
@@ -151,9 +163,11 @@ public class SurfaceEncoder implements AsyncProcessor {
                         throw e;
                     }
                     Ln.e("Capture/encoding error: " + e.getClass().getName() + ": " + e.getMessage());
-                    if (!prepareRetry()) {
+                    if (!prepareRetry(constraints, size)) {
                         throw e;
                     }
+                    // Keep the current resetReasons flags for the retry
+                    retainedResetReasons = resetReasons;
                     alive = true;
                 } finally {
                     captureControl.setRunningMediaCodec(null);
@@ -179,7 +193,7 @@ public class SurfaceEncoder implements AsyncProcessor {
         }
     }
 
-    private boolean prepareRetry() {
+    private boolean prepareRetry(VideoConstraints videoConstraints, Size currentSize) {
         if (firstFrameSent) {
             ++consecutiveErrors;
             if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
@@ -192,7 +206,39 @@ public class SurfaceEncoder implements AsyncProcessor {
             return true;
         }
 
-        return false;
+        if (!downsizeOnError) {
+            // Must fail immediately
+            return false;
+        }
+
+        // Downsizing on error is only enabled if an encoding failure occurs before the first frame (downsizing later could be surprising)
+
+        int newMaxSize = chooseMaxSizeFallback(currentSize);
+        if (newMaxSize == 0) {
+            // Must definitively fail
+            return false;
+        }
+
+        boolean accepted = capture.applyNewVideoConstraints(videoConstraints.withMaxSize(newMaxSize));
+        if (!accepted) {
+            return false;
+        }
+
+        // Retry with a smaller size
+        Ln.i("Retrying with -m" + newMaxSize + "...");
+        return true;
+    }
+
+    private static int chooseMaxSizeFallback(Size failedSize) {
+        int currentMaxSize = Math.max(failedSize.getWidth(), failedSize.getHeight());
+        for (int value : MAX_SIZE_FALLBACK) {
+            if (value < currentMaxSize) {
+                // We found a smaller value to reduce the video size
+                return value;
+            }
+        }
+        // No fallback, fail definitively
+        return 0;
     }
 
     private void encode(MediaCodec codec, Streamer streamer) throws IOException {
