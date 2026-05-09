@@ -18,6 +18,7 @@ import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
 import android.os.Build;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.view.Surface;
 
 import java.io.IOException;
@@ -31,6 +32,8 @@ public class SurfaceEncoder implements AsyncProcessor {
     private static final int REPEAT_FRAME_DELAY_US = 100_000; // repeat after 100ms
     private static final String KEY_MAX_FPS_TO_ENCODER = "max-fps-to-encoder";
 
+    private static final int MAX_CONSECUTIVE_ERRORS = 3;
+
     private final SurfaceCapture capture;
     private final Streamer streamer;
     private final String encoderName;
@@ -39,6 +42,9 @@ public class SurfaceEncoder implements AsyncProcessor {
     private final int maxSize;
     private final float maxFps;
     private final int minSizeAlignment;
+
+    private boolean firstFrameSent;
+    private int consecutiveErrors;
 
     private Thread thread;
     private final AtomicBoolean stopped = new AtomicBoolean();
@@ -139,6 +145,16 @@ public class SurfaceEncoder implements AsyncProcessor {
                         // The capture might have been closed internally (for example if the camera is disconnected)
                         alive = !stopped.get() && !capture.isClosed();
                     }
+                } catch (IllegalStateException | IllegalArgumentException | IOException e) {
+                    if (IO.isBrokenPipe(e)) {
+                        // Do not retry on broken pipe, which is expected on close because the socket is closed by the client
+                        throw e;
+                    }
+                    Ln.e("Capture/encoding error: " + e.getClass().getName() + ": " + e.getMessage());
+                    if (!prepareRetry()) {
+                        throw e;
+                    }
+                    alive = true;
                 } finally {
                     captureControl.setRunningMediaCodec(null);
                     if (captureStarted) {
@@ -163,6 +179,22 @@ public class SurfaceEncoder implements AsyncProcessor {
         }
     }
 
+    private boolean prepareRetry() {
+        if (firstFrameSent) {
+            ++consecutiveErrors;
+            if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+                // Definitively fail
+                return false;
+            }
+
+            // Wait a bit to increase the probability that retrying will fix the problem
+            SystemClock.sleep(50);
+            return true;
+        }
+
+        return false;
+    }
+
     private void encode(MediaCodec codec, Streamer streamer) throws IOException {
         MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
 
@@ -173,6 +205,13 @@ public class SurfaceEncoder implements AsyncProcessor {
                 eos = (bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
                 // On EOS, there might be data or not, depending on bufferInfo.size
                 if (outputBufferId >= 0 && bufferInfo.size > 0) {
+                    boolean isConfig = (bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
+                    if (!isConfig) {
+                        // If this is not a config packet, then it contains a frame
+                        firstFrameSent = true;
+                        consecutiveErrors = 0;
+                    }
+
                     ByteBuffer codecBuffer = codec.getOutputBuffer(outputBufferId);
                     streamer.writePacket(codecBuffer, bufferInfo);
                 }
